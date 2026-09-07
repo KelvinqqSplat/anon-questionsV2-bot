@@ -1,4 +1,3 @@
 aiogram
-aiosqlite
 fastapi
 uvicorn
