@@ -1,4 +1,10 @@
-import os, logging, asyncio, sqlite3, random, string, threading
+import os
+import logging
+import asyncio
+import sqlite3
+import random
+import string
+import threading
 from fastapi import FastAPI
 import uvicorn
 from aiogram import Bot, Dispatcher, types, F
@@ -15,7 +21,7 @@ ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("
 DB_PATH = "data.db"
 logging.basicConfig(level=logging.INFO)
 
-# === БАЗА ДАННЫХ (SQLite, синхронная, но быстрая) ===
+# === БАЗА ДАННЫХ (SQLite, синхронная) ===
 def db():
     return sqlite3.connect(DB_PATH)
 
@@ -211,24 +217,91 @@ async def cancel_ask(message: types.Message, state: FSMContext):
 async def ask_question(message: types.Message, state: FSMContext):
     data = await state.get_data()
     target = data.get("target")
-    if not target: return await message.answer("Ошибка", reply_markup=main_kb(message.from_user.id))
-    if is_blocked(target, message.from_user.id): return await message.answer("Ты заблокирован.", reply_markup=main_kb(message.from_user.id))
+    if not target:
+        await message.answer("Ошибка, попробуй /start", reply_markup=main_kb(message.from_user.id))
+        await state.clear()
+        return
+    if is_blocked(target, message.from_user.id):
+        await message.answer("Ты заблокирован этим пользователем.", reply_markup=main_kb(message.from_user.id))
+        await state.clear()
+        return
     q_id = save_question(None, target, message.text)
     await bot.send_message(target, f"📩 Новый вопрос:\n\n{message.text}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Ответить", callback_data=f"reply_{q_id}")]]))
-    await message.answer("✅ Отправлено!", reply_markup=main_kb(message.from_user.id))
+    await message.answer("✅ Вопрос отправлен анонимно!", reply_markup=main_kb(message.from_user.id))
     await state.clear()
+
+# ===== ИСПРАВЛЕННЫЙ БЛОК ОТВЕТОВ =====
+@dp.callback_query(F.data.startswith("reply_"))
+async def reply_question(callback: types.CallbackQuery, state: FSMContext):
+    q_id = int(callback.data.split("_")[1])
+    q = get_question(q_id)
+    if not q or q[2] != callback.from_user.id:
+        await callback.answer("❌ Недоступно")
+        return
+    # Сохраняем в состояние
+    await state.update_data(reply_qid=q_id, reply_to=q[1])
+    await callback.message.answer(
+        "✏️ Напиши свой ответ:",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="❌ Отмена")]],
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(ReplyState.waiting)
+    await callback.answer()
+
+@dp.message(F.text == "❌ Отмена", StateFilter(ReplyState.waiting))
+async def cancel_reply(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отменено.", reply_markup=main_kb(message.from_user.id))
 
 @dp.message(ReplyState.waiting)
 async def reply_text(message: types.Message, state: FSMContext):
     data = await state.get_data()
     q_id = data.get("reply_qid")
     to_user = data.get("reply_to")
-    if not q_id or not to_user: return await message.answer("Ошибка", reply_markup=main_kb(message.from_user.id))
-    new_q = save_reply(None, to_user, message.text, q_id)
-    await bot.send_message(to_user, f"📩 Ответ:\n\n{message.text}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✏️ Ответить", callback_data=f"reply_{new_q}")]]))
-    await message.answer("✅ Ответ отправлен!", reply_markup=main_kb(message.from_user.id))
-    await state.clear()
+    
+    # Проверяем, что данные есть
+    if not q_id or not to_user:
+        await message.answer(
+            "❌ Ошибка: данные утеряны. Попробуй ещё раз нажать 'Ответить' на вопрос.",
+            reply_markup=main_kb(message.from_user.id)
+        )
+        await state.clear()
+        return
+    
+    # Проверяем, что вопрос существует
+    q = get_question(q_id)
+    if not q:
+        await message.answer("❌ Вопрос уже удалён.", reply_markup=main_kb(message.from_user.id))
+        await state.clear()
+        return
+    
+    # Проверяем, не заблокирован ли отправитель
+    if is_blocked(to_user, message.from_user.id):
+        await message.answer("🚫 Этот пользователь заблокировал тебя.", reply_markup=main_kb(message.from_user.id))
+        await state.clear()
+        return
+    
+    try:
+        # Сохраняем ответ
+        new_q = save_reply(None, to_user, message.text, q_id)
+        # Отправляем ответ получателю
+        await bot.send_message(
+            to_user,
+            f"📩 Получен ответ на твой вопрос:\n\n{message.text}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="✏️ Ответить", callback_data=f"reply_{new_q}")]]
+            )
+        )
+        await message.answer("✅ Ответ отправлен анонимно!", reply_markup=main_kb(message.from_user.id))
+    except Exception as e:
+        logging.error(f"Ошибка при отправке ответа: {e}")
+        await message.answer(f"❌ Ошибка при отправке: {str(e)}", reply_markup=main_kb(message.from_user.id))
+    finally:
+        await state.clear()
 
+# --- Остальные хендлеры ---
 @dp.message(F.text == "📩 Задать вопрос")
 async def ask_button(message: types.Message):
     await message.answer("✏️ Чтобы задать вопрос, перейди по ссылке пользователя. Если уже перешёл — напиши вопрос.", reply_markup=cancel_kb())
@@ -237,7 +310,9 @@ async def ask_button(message: types.Message):
 async def incoming_button(message: types.Message):
     user_id = message.from_user.id
     qs = get_incoming(user_id, 10, 0)
-    if not qs: return await message.answer("Нет вопросов.", reply_markup=main_kb(user_id))
+    if not qs:
+        await message.answer("Нет вопросов.", reply_markup=main_kb(user_id))
+        return
     for q in qs: mark_read(q[0])
     has_more = len(get_incoming(user_id, 1, 10)) > 0
     await message.answer("📥 Входящие:", reply_markup=inline_incoming(qs, 0, has_more))
@@ -251,16 +326,22 @@ async def mylink_button(message: types.Message):
     if row:
         bot_info = await bot.get_me()
         await message.answer(f"🔗 Твоя ссылка:\n<code>https://t.me/{bot_info.username}?start={row[0]}</code>", reply_markup=main_kb(message.from_user.id), parse_mode="HTML")
+    else:
+        await message.answer("Ошибка, попробуй /start", reply_markup=main_kb(message.from_user.id))
 
 @dp.message(F.text == "🚫 Заблокированные")
 async def blocks_button(message: types.Message):
     blocked = get_blocked(message.from_user.id)
-    if not blocked: return await message.answer("Нет заблокированных.", reply_markup=main_kb(message.from_user.id))
+    if not blocked:
+        await message.answer("Нет заблокированных.", reply_markup=main_kb(message.from_user.id))
+        return
     await message.answer("🚫 Заблокированные:", reply_markup=blocks_kb(blocked))
 
 @dp.message(F.text == "⚙️ Админ-панель")
 async def admin_button(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return await message.answer("Нет прав", reply_markup=main_kb(message.from_user.id))
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("Нет прав", reply_markup=main_kb(message.from_user.id))
+        return
     await message.answer("⚙️ Админ-панель:", reply_markup=admin_kb())
 
 # --- Инлайн колбэки ---
@@ -275,7 +356,10 @@ async def back_incoming(callback: types.CallbackQuery):
     await callback.message.delete()
     user_id = callback.from_user.id
     qs = get_incoming(user_id, 10, 0)
-    if not qs: return await callback.message.answer("Нет вопросов.", reply_markup=main_kb(user_id))
+    if not qs:
+        await callback.message.answer("Нет вопросов.", reply_markup=main_kb(user_id))
+        await callback.answer()
+        return
     has_more = len(get_incoming(user_id, 1, 10)) > 0
     await callback.message.answer("📥 Входящие:", reply_markup=inline_incoming(qs, 0, has_more))
     await callback.answer()
@@ -284,29 +368,27 @@ async def back_incoming(callback: types.CallbackQuery):
 async def view_question(callback: types.CallbackQuery):
     q_id = int(callback.data.split("_")[1])
     q = get_question(q_id)
-    if not q or q[2] != callback.from_user.id: return await callback.answer("Недоступно")
-    await callback.message.edit_text(f"📩 Вопрос:\n\n{q[3]}", reply_markup=question_kb(q_id, q[7] is not None))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("reply_"))
-async def reply_question(callback: types.CallbackQuery, state: FSMContext):
-    q_id = int(callback.data.split("_")[1])
-    q = get_question(q_id)
-    if not q or q[2] != callback.from_user.id: return await callback.answer("Недоступно")
-    await state.update_data(reply_qid=q_id, reply_to=q[1])
-    await callback.message.answer("✏️ Напиши ответ:", reply_markup=cancel_kb())
-    await state.set_state(ReplyState.waiting)
+    if not q or q[2] != callback.from_user.id:
+        await callback.answer("Недоступно")
+        return
+    answered = q[7] is not None
+    await callback.message.edit_text(f"📩 Вопрос:\n\n{q[3]}", reply_markup=question_kb(q_id, answered))
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("block_"))
 async def block_cb(callback: types.CallbackQuery):
     q_id = int(callback.data.split("_")[1])
     q = get_question(q_id)
-    if not q or q[2] != callback.from_user.id: return await callback.answer("Недоступно")
-    if not q[1]: return await callback.answer("Аноним, нельзя заблокировать")
+    if not q or q[2] != callback.from_user.id:
+        await callback.answer("Недоступно")
+        return
+    if not q[1]:
+        await callback.answer("Анонимный вопрос, нельзя заблокировать")
+        return
     block_user(callback.from_user.id, q[1])
-    await callback.answer("Заблокирован")
-    await callback.message.edit_text("🚫 Заблокирован")
+    await callback.answer("Пользователь заблокирован")
+    await callback.message.edit_text("🚫 Пользователь заблокирован")
+    # Возврат к списку входящих
     await back_incoming(callback)
 
 @dp.callback_query(F.data.startswith("unblock_"))
@@ -324,61 +406,88 @@ async def unblock_cb(callback: types.CallbackQuery):
 async def report_cb(callback: types.CallbackQuery):
     q_id = int(callback.data.split("_")[1])
     q = get_question(q_id)
-    if not q or q[2] != callback.from_user.id: return await callback.answer("Недоступно")
+    if not q or q[2] != callback.from_user.id:
+        await callback.answer("Недоступно")
+        return
     add_report(callback.from_user.id, q_id)
     for admin in ADMIN_IDS:
-        try: await bot.send_message(admin, f"⚠️ Жалоба на вопрос #{q_id} от {callback.from_user.id}\n\n{q[3]}")
-        except: pass
-    await callback.answer("Жалоба отправлена")
+        try:
+            await bot.send_message(admin, f"⚠️ Жалоба на вопрос #{q_id} от {callback.from_user.id}\n\n{q[3]}")
+        except:
+            pass
+    await callback.answer("Жалоба отправлена админу")
 
 @dp.callback_query(F.data.startswith("page_"))
 async def page_cb(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
     qs = get_incoming(user_id, 10, page*10)
-    if not qs: return await callback.answer("Нет вопросов")
+    if not qs:
+        await callback.answer("Нет вопросов на этой странице")
+        return
     has_more = len(get_incoming(user_id, 1, (page+1)*10)) > 0
     await callback.message.edit_reply_markup(reply_markup=inline_incoming(qs, page, has_more))
     await callback.answer()
 
 @dp.callback_query(F.data == "stats")
 async def stats_cb(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("Нет прав")
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет прав")
+        return
     users, total, incoming, replies, reports = get_stats()
-    await callback.message.edit_text(f"📊 Статистика:\n👤 {users}\n📩 {total}\n📥 {incoming}\n✏️ {replies}\n⚠️ {reports}", reply_markup=admin_kb())
+    await callback.message.edit_text(f"📊 Статистика:\n👤 Пользователей: {users}\n📩 Всего вопросов: {total}\n📥 Входящих: {incoming}\n✏️ Ответов: {replies}\n⚠️ Жалоб: {reports}", reply_markup=admin_kb())
     await callback.answer()
 
 @dp.callback_query(F.data == "reports_list")
 async def reports_cb(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS: return await callback.answer("Нет прав")
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("Нет прав")
+        return
     reports = get_reports(20)
-    if not reports: return await callback.message.edit_text("Нет жалоб.", reply_markup=admin_kb())
-    text = "⚠️ Жалобы:\n\n" + "\n".join([f"#{r[0]} от {r[1]} на вопрос #{r[2]}\n{r[4][:100]}\n---" for r in reports])
+    if not reports:
+        await callback.message.edit_text("Нет жалоб.", reply_markup=admin_kb())
+        await callback.answer()
+        return
+    text = "⚠️ Жалобы:\n\n"
+    for r in reports:
+        text += f"#{r[0]} от {r[1]} на вопрос #{r[2]}\nТекст: {r[4][:100]}\n---\n"
     await callback.message.edit_text(text, reply_markup=admin_kb())
     await callback.answer()
 
-# --- Рассылка ---
+# --- Рассылка (команда) ---
 @dp.message(Command("broadcast"))
 async def broadcast_cmd(message: types.Message):
-    if message.from_user.id not in ADMIN_IDS: return await message.answer("Нет прав")
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет прав")
+        return
     text = message.text.replace("/broadcast", "").strip()
-    if not text: return await message.answer("Напиши текст после /broadcast")
+    if not text:
+        await message.answer("📝 Напиши текст после /broadcast")
+        return
     users = get_all_users()
-    if not users: return await message.answer("Нет пользователей")
+    if not users:
+        await message.answer("Нет пользователей")
+        return
     msg = await message.answer("📨 Рассылка...")
     count = 0
     for uid in users:
-        try: await bot.send_message(uid, text); count += 1; await asyncio.sleep(0.05)
-        except: pass
+        try:
+            await bot.send_message(uid, text)
+            count += 1
+            await asyncio.sleep(0.05)
+        except:
+            pass
     await msg.edit_text(f"✅ Отправлено {count} из {len(users)}")
 
 # === KEEP-ALIVE ===
 web_app = FastAPI()
 @web_app.get("/")
-def health(): return {"status": "ok"}
+def health():
+    return {"status": "ok"}
 
 def run_web():
-    uvicorn.run(web_app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(web_app, host="0.0.0.0", port=port)
 
 async def main():
     await dp.start_polling(bot)
